@@ -52,7 +52,7 @@ cd iscsicsi
 chmod +x iscsicsi.py iscsicsiscan.py
 ```
 
-No external Python dependency (standard library only, Python 3.8+).
+No external Python dependency (standard library only, Python 3.10+).
 
 ### System requirements
 
