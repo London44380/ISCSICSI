@@ -13,6 +13,7 @@ open-iscsi system tools (iscsiadm), mount, umount, lsblk.
 Only use this on hosts you own or are explicitly authorized to test.
 """
 import getpass
+import glob
 import os
 import re
 import shutil
@@ -181,6 +182,32 @@ def logout(iqn: str, portal: str) -> None:
     run(["iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--logout"], check=False)
 
 
+SCSI_TYPES = {
+    0: "disk", 1: "tape", 3: "processor", 4: "WORM", 5: "CD/DVD",
+    7: "optical", 8: "medium changer", 12: "storage controller (RAID/array)",
+    13: "enclosure",
+}
+
+
+def describe_scsi_luns(session_output: str) -> list[str]:
+    """Describes each LUN of the session (type/vendor/model) by reading sysfs,
+    to tell a real disk from a controller LUN (e.g. IET exposing only a
+    'Controller' with no volume mapped)."""
+    out = []
+    for host in sorted(set(re.findall(r"Host Number:\s*(\d+)", session_output))):
+        for dev in sorted(glob.glob(f"/sys/bus/scsi/devices/{host}:*:*:*")):
+            def rd(name: str) -> str:
+                try:
+                    with open(os.path.join(dev, name)) as f:
+                        return f.read().strip()
+                except OSError:
+                    return "?"
+            raw = rd("type")
+            label = SCSI_TYPES.get(int(raw), f"type {raw}") if raw.isdigit() else raw
+            out.append(f"{os.path.basename(dev)}: {label} - {rd('vendor')} {rd('model')}")
+    return out
+
+
 def dump_session_detail() -> None:
     """Prints the detail of the active session (number of LUNs seen, etc.)
     before logging out, to diagnose a target without a device without
@@ -192,9 +219,15 @@ def dump_session_detail() -> None:
     print(paint("--- Session detail (iscsiadm -m session -P 3) ---", 40))
     print(proc.stdout.strip())
     print(paint("--- end of detail ---", 40))
-    if "Attached scsi disk" in proc.stdout or re.search(r"scsi\d+ Channel", proc.stdout):
-        ok("At least one LUN/disk is attached according to iscsiadm — the device should "
-           "exist. Check 'lsblk' manually before the script ends if needed.")
+    if "Attached scsi disk" in proc.stdout:
+        ok("At least one disk is attached according to iscsiadm (Attached scsi disk) "
+           "— the device should exist. Check 'lsblk' manually if needed.")
+    elif re.search(r"scsi\d+ Channel", proc.stdout):
+        for line in describe_scsi_luns(proc.stdout):
+            warn(f"LUN seen by the kernel -> {line}")
+        warn("The target exposes a SCSI LUN but no DISK is attached (probably a "
+             "controller/enclosure LUN 0, or the disk LUN is not mapped to this "
+             "initiator). Map a disk LUN to this IQN on the server side.")
     else:
         warn("No LUN/disk listed in the session: the target is probably exposing "
              "nothing to this initiator (ACL by IQN restricting visible LUNs, or "
