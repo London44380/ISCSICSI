@@ -17,6 +17,7 @@ import glob
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -352,7 +353,7 @@ def mount_readonly(device: str) -> Path | None:
     mountpoint = Path(f"/mnt/iscsicsi-{int(time.time())}")
     mountpoint.mkdir(parents=True, exist_ok=True)
     ok(f"Mounting {device} read-only on {mountpoint} ...")
-    proc = run(["mount", "-o", "ro", device, str(mountpoint)], check=False)
+    proc = run(["mount", "-o", "ro,nodev,nosuid,noexec", device, str(mountpoint)], check=False)
     if proc.returncode != 0:
         err(f"Mount failed: {proc.stderr.strip()}")
         explain_mount_failure(device)
@@ -514,6 +515,10 @@ def copy_tree(src: Path, dest: Path) -> tuple[int, int]:
                 if e.is_dir(follow_symlinks=False):
                     (d_dir / e.name).mkdir(exist_ok=True)
                     stack.append((Path(e.path), d_dir / e.name))
+                elif not e.is_file(follow_symlinks=False):
+                    # FIFO/socket/device node: opening a FIFO would hang, and a
+                    # device node would read a LOCAL device, not the target's data.
+                    warn(f"Skipping special file: {e.path}")
                 else:
                     shutil.copy2(e.path, d_dir / e.name, follow_symlinks=False)
                     copied += 1
@@ -540,6 +545,8 @@ def copy_selected(files: list[Path], loot_dir: Path, root: Path | None = None) -
                 copied, failed = copy_tree(f, dest)
                 ok(f"Copied folder: {f} -> {dest} ({copied} files"
                    + (f", {failed} errors" if failed else "") + ")")
+            elif not stat.S_ISREG(f.stat().st_mode):
+                warn(f"Skipping special file (not a regular file): {f}")
             else:
                 shutil.copy2(f, dest)
                 ok(f"Copied: {f} -> {dest}")
