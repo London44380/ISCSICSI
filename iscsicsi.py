@@ -222,13 +222,49 @@ def wait_for_new_block_devices(before: set[str], timeout: float = 15.0) -> list[
 
 
 def list_partitions(device: str) -> list[str]:
-    proc = run(["lsblk", "-nlo", "NAME,TYPE", device], check=False)
-    parts = []
-    for line in proc.stdout.splitlines():
-        fields = line.split()
-        if len(fields) == 2 and fields[1] == "part":
-            parts.append(f"/dev/{fields[0]}")
-    return parts or [device]
+    """Lists the partitions of `device`. Partition nodes can show up a moment
+    after the disk itself, so ask the kernel to re-read the table and let
+    udev settle first; otherwise we could wrongly fall back to the whole
+    disk and fail to mount it."""
+    run(["partprobe", device], check=False)
+    run(["udevadm", "settle", "--timeout=5"], check=False)
+    for attempt in range(3):
+        proc = run(["lsblk", "-nlo", "NAME,TYPE", device], check=False)
+        parts = []
+        for line in proc.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "part":
+                parts.append(f"/dev/{fields[0]}")
+        if parts:
+            return parts
+        time.sleep(1)
+    return [device]
+
+
+def explain_mount_failure(device: str) -> None:
+    """Gives a hint about WHY the mount failed (no filesystem, LUKS, LVM,
+    BitLocker...) instead of only the raw mount error."""
+    proc = run(["blkid", "-p", "-o", "export", device], check=False)
+    info = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+    fstype = info.get("TYPE") or info.get("PTTYPE")
+    hints = {
+        "crypto_LUKS": "LUKS-encrypted volume: unlock it with cryptsetup first.",
+        "LVM2_member": "LVM physical volume: activate it (vgchange -ay) and mount the logical volume.",
+        "BitLocker": "BitLocker-encrypted volume: use dislocker.",
+        "ntfs": "NTFS volume: may be dirty/hibernated, or ntfs-3g is missing.",
+        "xfs": "XFS volume: the xfs kernel module may be missing, or the log needs replay.",
+        "zfs_member": "ZFS member: import the pool instead of mounting.",
+        "linux_raid_member": "RAID member: assemble the array (mdadm) first.",
+    }
+    if not fstype:
+        warn(f"No filesystem or partition table detected on {device}: the LUN is "
+             "probably blank or uses a raw/unknown format.")
+    else:
+        warn(f"{device}: detected type '{fstype}'. " + hints.get(
+            fstype, "The kernel could not mount it; check the matching module/tool."))
+    tail = run(["dmesg"], check=False).stdout.strip().splitlines()[-5:]
+    if tail:
+        warn("Last kernel messages:\n    " + "\n    ".join(tail))
 
 
 def mount_readonly(device: str) -> Path | None:
@@ -238,6 +274,7 @@ def mount_readonly(device: str) -> Path | None:
     proc = run(["mount", "-o", "ro", device, str(mountpoint)], check=False)
     if proc.returncode != 0:
         err(f"Mount failed: {proc.stderr.strip()}")
+        explain_mount_failure(device)
         mountpoint.rmdir()
         return None
     return mountpoint
