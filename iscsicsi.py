@@ -262,7 +262,24 @@ def explain_mount_failure(device: str) -> None:
     else:
         warn(f"{device}: detected type '{fstype}'. " + hints.get(
             fstype, "The kernel could not mount it; check the matching module/tool."))
-    tail = run(["dmesg"], check=False).stdout.strip().splitlines()[-5:]
+    if fstype == "LVM2_member":
+        # Read-only lookup of the VG name; nothing is activated here.
+        vg = run(["pvs", "--noheadings", "-o", "vg_name", device],
+                 check=False).stdout.strip() or "<vg>"
+        warn("To access it manually (read-only):\n"
+             f"    sudo vgchange -ay {vg}\n"
+             f"    sudo lvs {vg}\n"
+             f"    sudo mount -o ro /dev/{vg}/<lv> /mnt/test\n"
+             "    (if the LV is LUKS-encrypted: cryptsetup open first)")
+    # Keep only kernel lines about this disk/storage; drop unrelated noise
+    # (firewall blocks, network chatter...) that happens to be most recent.
+    name = Path(device).name
+    base = name.rstrip("0123456789") if not name.startswith(("nvme", "mmcblk")) else name
+    relevant = re.compile(
+        rf"\b({re.escape(name)}|{re.escape(base)})\b|iscsi|scsi|lvm|device-mapper|"
+        r"ext[234]|xfs|btrfs|ntfs|fat|squashfs|I/O error|crypt", re.I)
+    lines = run(["dmesg"], check=False).stdout.strip().splitlines()
+    tail = [l for l in lines if relevant.search(l) and "UFW" not in l][-5:]
     if tail:
         warn("Last kernel messages:\n    " + "\n    ".join(tail))
 
