@@ -69,8 +69,8 @@ sudo apt install open-iscsi   # Debian/Ubuntu
 
 ## Security and best practices
 
-- Mounting is always **read-only** (`-o ro`) — no write is ever possible on the tested target.
-- The target's filesystem is untrusted content: a symlink on it that resolves outside the mountpoint is detected and refused, both when entering it as a folder and when selecting it as a file — so a malicious target can't use one to make the tool read or copy files from your own machine instead of the target's.
+- Mounting is always **read-only** and hardened (`-o ro,nodev,nosuid,noexec`) — no write is ever possible on the tested target, and device nodes on it are unusable.
+- The target's filesystem is untrusted content: a symlink on it that resolves outside the mountpoint is detected and refused, both when entering it as a folder and when selecting it as a file — so a malicious target can't use one to make the tool read or copy files from your own machine instead of the target's. When copying, only regular files are read: FIFOs, sockets and device nodes found on the target are skipped (a device node would otherwise read one of *your* local devices).
 - The iSCSI session is systematically closed (`--logout`) at the end, including on error or interruption (`Ctrl+C`).
 - Terminal colors are automatically disabled if the output isn't a terminal, or if the `NO_COLOR` environment variable is set.
 - Always test `iscsicsiscan.py` before `iscsicsi.py` to confirm a real iSCSI service responds, before attempting a full connection.
