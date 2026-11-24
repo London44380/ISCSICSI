@@ -17,6 +17,7 @@ import glob
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -182,6 +183,33 @@ def configure_chap(iqn: str, portal: str) -> None:
 def logout(iqn: str, portal: str) -> None:
     ok("Logging out of the iSCSI session ...")
     run(["iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "--logout"], check=False)
+
+
+def install_signal_cleanup(mountpoint, iqn: str, portal: str) -> None:
+    """Make sure SIGTERM/SIGHUP also trigger umount+logout.
+
+    Only Ctrl+C (SIGINT -> KeyboardInterrupt) unwinds the Python stack and
+    runs the try/finally cleanup on its own. A closed terminal (SIGHUP) or
+    an external kill (SIGTERM) bypasses that entirely, leaving the iSCSI
+    session logged in indefinitely. These handlers close the session first,
+    then re-raise the default behavior so the process still exits as the
+    signal intended.
+    """
+    def _handler(signum, _frame):
+        try:
+            run(["umount", str(mountpoint)], check=False)
+        except OSError:
+            pass
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            pass
+        logout(iqn, portal)
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _handler)
 
 
 SCSI_TYPES = {
@@ -608,6 +636,8 @@ def main() -> None:
     if mountpoint is None:
         logout(iqn, portal)
         sys.exit(1)
+
+    install_signal_cleanup(mountpoint, iqn, portal)
 
     try:
         selected = browse_and_select(mountpoint)
