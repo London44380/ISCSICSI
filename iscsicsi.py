@@ -105,13 +105,14 @@ def discover(ip: str, port: str) -> list[str]:
     return sorted(set(iqns))
 
 
-def choose(items: list[str], label: str) -> str:
+def choose(items: list[str], label: str, describe=None) -> str:
     if len(items) == 1:
         ok(f"Found a single {label}: {items[0]}")
         return items[0]
     print(paint(f"Choose a {label}:", 40))
     for i, item in enumerate(items, 1):
-        print(f"  {i}. {item}")
+        extra = describe(item) if describe else ""
+        print(f"  {i}. {item}" + (f"  ({extra})" if extra else ""))
     while True:
         choice = input(paint("> ", 34)).strip()
         if choice.isdigit() and 1 <= int(choice) <= len(items):
@@ -274,6 +275,31 @@ def list_partitions(device: str) -> list[str]:
     return [device]
 
 
+def describe_partition(device: str) -> str:
+    """Size, filesystem, label and partition type of a partition, so the
+    user can tell the real data partition from a tiny reserved/boot one."""
+    proc = run(["lsblk", "-ndo", "SIZE,FSTYPE,LABEL,PARTTYPENAME", device], check=False)
+    fields = proc.stdout.strip().split(None, 1)
+    if not fields:
+        return ""
+    rest = fields[1] if len(fields) > 1 else ""
+    return f"{fields[0]}, {rest.strip() or 'no filesystem detected'}"
+
+
+def sibling_partitions(device: str) -> list[str]:
+    """Other partitions on the same disk as `device` (empty if none)."""
+    parent = run(["lsblk", "-ndo", "PKNAME", device], check=False).stdout.strip()
+    if not parent:
+        return []
+    proc = run(["lsblk", "-nlo", "NAME,TYPE", f"/dev/{parent}"], check=False)
+    names = []
+    for line in proc.stdout.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[1] == "part" and f"/dev/{f[0]}" != device:
+            names.append(f"/dev/{f[0]}")
+    return names
+
+
 def explain_mount_failure(device: str) -> None:
     """Gives a hint about WHY the mount failed (no filesystem, LUKS, LVM,
     BitLocker...) instead of only the raw mount error."""
@@ -289,7 +315,12 @@ def explain_mount_failure(device: str) -> None:
         "zfs_member": "ZFS member: import the pool instead of mounting.",
         "linux_raid_member": "RAID member: assemble the array (mdadm) first.",
     }
-    if not fstype:
+    others = sibling_partitions(device) if not fstype else []
+    if not fstype and others:
+        warn(f"No filesystem detected on {device}, but the disk has other partitions "
+             f"({', '.join(others)}). This is probably a reserved/boot partition: "
+             "try the other one(s).")
+    elif not fstype:
         warn(f"No filesystem or partition table detected on {device}: the LUN is "
              "probably blank or uses a raw/unknown format.")
     else:
@@ -343,10 +374,47 @@ def escapes_mount(entry: Path, root: Path) -> bool:
         return True
 
 
+def human_size(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if size < 1024 or unit == "T":
+            return f"{int(size)}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{n}B"
+
+
+def dir_size(path: Path, budget: float = 1.0) -> tuple[int, bool]:
+    """Total size of the files under `path` and whether the count is complete.
+    Never follows symlinks (the remote target is untrusted, and a link could
+    point at local files). Stops after `budget` seconds: a big tree on a
+    remote iSCSI disk can take very long to walk."""
+    deadline = time.monotonic() + budget
+    total, stack = 0, [path]
+    while stack:
+        if time.monotonic() > deadline:
+            return total, False
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    try:
+                        if e.is_symlink():
+                            continue
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(Path(e.path))
+                        else:
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total, True
+
+
 def browse_and_select(root: Path) -> list[Path]:
     """Numbered-menu navigation. Returns the chosen files."""
     selected: list[Path] = []
     current = root
+    sizes: dict[Path, str] = {}  # computed once per entry, reused on revisit
     while True:
         try:
             entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -357,12 +425,30 @@ def browse_and_select(root: Path) -> list[Path]:
 
         print(paint(f"\nCurrent folder: {current}", 40))
         print(f"  (selected so far: {len(selected)})")
+        walk_budget = 5.0  # total seconds spent measuring folders per listing
         for i, entry in enumerate(entries, 1):
             if escapes_mount(entry, root):
-                tag = "blocked symlink"
+                tag, size = "blocked symlink", ""
+            elif entry.is_dir():
+                tag = "DIR"
+                if entry not in sizes:
+                    start = time.monotonic()
+                    if walk_budget > 0:
+                        total, done = dir_size(entry, min(1.0, walk_budget))
+                        sizes[entry] = human_size(total) if done else f">{human_size(total)}"
+                    else:
+                        sizes[entry] = "?"
+                    walk_budget -= time.monotonic() - start
+                size = sizes[entry]
             else:
-                tag = "DIR" if entry.is_dir() else "file"
-            print(f"  {i}. [{tag}] {entry.name}")
+                tag = "file"
+                try:
+                    size = human_size(entry.lstat().st_size)
+                except OSError:
+                    size = "?"
+            mark = "*" if entry in selected else " "
+            print(f" {mark}{i}. [{tag}] {entry.name}" + (f"  ({size})" if size else ""))
+        print("  c<N>. Select/deselect FOLDER N to copy it entirely (e.g. c3)")
         print("  0. .. (go up)")
         print("  s. Finish selection and copy")
         print("  q. Quit without copying")
@@ -374,6 +460,19 @@ def browse_and_select(root: Path) -> list[Path]:
             return selected
         if choice == "0":
             current = current.parent if current != root else root
+            continue
+        if choice.startswith("c") and choice[1:].isdigit() and 1 <= int(choice[1:]) <= len(entries):
+            entry = entries[int(choice[1:]) - 1]
+            if escapes_mount(entry, root):
+                warn(f"'{entry.name}' is a symlink pointing outside the mounted filesystem - refused.")
+            elif not entry.is_dir():
+                warn(f"'{entry.name}' is a file: just type its number to select it.")
+            elif entry in selected:
+                selected.remove(entry)
+                ok(f"Deselected folder: {entry.name}")
+            else:
+                selected.append(entry)
+                ok(f"Selected folder: {entry.name} ({sizes.get(entry, '?')})")
             continue
         if choice.isdigit() and 1 <= int(choice) <= len(entries):
             entry = entries[int(choice) - 1]
@@ -393,13 +492,57 @@ def browse_and_select(root: Path) -> list[Path]:
             print("Invalid entry.")
 
 
-def copy_selected(files: list[Path], loot_dir: Path) -> None:
-    loot_dir.mkdir(parents=True, exist_ok=True)
-    for f in files:
-        dest = loot_dir / f.name
+def copy_tree(src: Path, dest: Path) -> tuple[int, int]:
+    """Copies a folder recursively. Symlinks are skipped: the source is an
+    untrusted remote filesystem and a link could point at local files.
+    Returns (copied, failed)."""
+    copied = failed = 0
+    dest.mkdir(parents=True, exist_ok=True)
+    stack = [(src, dest)]
+    while stack:
+        s_dir, d_dir = stack.pop()
         try:
-            shutil.copy2(f, dest)
-            ok(f"Copied: {f} -> {dest}")
+            entries = list(os.scandir(s_dir))
+        except OSError as e:
+            err(f"Cannot read {s_dir}: {e}")
+            failed += 1
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    (d_dir / e.name).mkdir(exist_ok=True)
+                    stack.append((Path(e.path), d_dir / e.name))
+                else:
+                    shutil.copy2(e.path, d_dir / e.name, follow_symlinks=False)
+                    copied += 1
+            except Exception as ex:
+                err(f"Failed to copy {e.path}: {ex}")
+                failed += 1
+    return copied, failed
+
+
+def copy_selected(files: list[Path], loot_dir: Path, root: Path | None = None) -> None:
+    """Copies files and folders. With `root` (the mountpoint), the folder
+    layout is kept so two items with the same name don't overwrite each other."""
+    loot_dir.mkdir(parents=True, exist_ok=True)
+    base = loot_dir.resolve()
+    for f in files:
+        rel = f.relative_to(root) if root is not None else Path(f.name)
+        dest = loot_dir / rel
+        if base not in dest.resolve().parents and dest.resolve() != base:
+            err(f"Refusing to write outside {loot_dir}: {rel}")
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if f.is_dir():
+                copied, failed = copy_tree(f, dest)
+                ok(f"Copied folder: {f} -> {dest} ({copied} files"
+                   + (f", {failed} errors" if failed else "") + ")")
+            else:
+                shutil.copy2(f, dest)
+                ok(f"Copied: {f} -> {dest}")
         except Exception as e:
             err(f"Failed to copy {f}: {e}")
 
@@ -452,7 +595,7 @@ def main() -> None:
 
     device = choose(new_devices, "disk")
     partitions = list_partitions(device)
-    partition = choose(partitions, "partition")
+    partition = choose(partitions, "partition", describe_partition)
 
     mountpoint = mount_readonly(partition)
     if mountpoint is None:
@@ -463,7 +606,7 @@ def main() -> None:
         selected = browse_and_select(mountpoint)
         if selected:
             loot_dir = Path.home() / "iscsi-loot" / re.sub(r"[^A-Za-z0-9._-]", "_", iqn)
-            copy_selected(selected, loot_dir)
+            copy_selected(selected, loot_dir, mountpoint)
             ok(f"Done. Files in: {loot_dir}")
         else:
             warn("No file copied.")

@@ -36,7 +36,7 @@ Discovery → connection to a target → mounting the disk **read-only** → int
 sudo python3 iscsicsi.py <target_ip> [port=3260]
 ```
 
-Navigation: a numbered menu lets you enter a folder, select/deselect files (`s` to confirm and copy, `0` to go up, `q` to cancel).
+Navigation: a numbered menu lets you enter a folder, select/deselect files, or whole folders with `c<N>` (e.g. `c3`; marked with `*`), `s` to confirm and copy, `0` to go up, `q` to cancel). Copies keep the folder layout under `~/iscsi-loot/<target>/`; symlinks inside copied folders are skipped. Each folder shows its total size (measured with a short time limit, shown as `>X` if cut off).
 
 **Useful automatic behaviors:**
 - **Real portal detection**: after discovery, the tool re-reads the `iscsiadm` database to find the portal actually registered, in case the server advertises an address different from the one used for discovery (NAT, multi-homed interface, IPv6…).
